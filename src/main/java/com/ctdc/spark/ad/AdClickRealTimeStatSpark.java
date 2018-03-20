@@ -2,9 +2,17 @@ package com.ctdc.spark.ad;
 
 import com.ctdc.conf.ConfigurationManager;
 import com.ctdc.constant.Constants;
+import com.ctdc.dao.IAdUserClickCountDAO;
+import com.ctdc.dao.factory.DAOFactory;
+import com.ctdc.domain.AdUserClickCount;
+import com.ctdc.util.DateUtils;
 import kafka.serializer.StringDecoder;
 import org.apache.spark.SparkConf;
+import org.apache.spark.api.java.JavaPairRDD;
+import org.apache.spark.api.java.function.Function;
+import org.apache.spark.api.java.function.Function2;
 import org.apache.spark.api.java.function.PairFunction;
+import org.apache.spark.api.java.function.VoidFunction;
 import org.apache.spark.streaming.Duration;
 import org.apache.spark.streaming.Durations;
 import org.apache.spark.streaming.api.java.JavaPairDStream;
@@ -13,10 +21,7 @@ import org.apache.spark.streaming.api.java.JavaStreamingContext;
 import org.apache.spark.streaming.kafka.KafkaUtils;
 import scala.Tuple2;
 
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Map;
-import java.util.Set;
+import java.util.*;
 
 /**
  * 广告点击流量实时统计spark作业
@@ -97,46 +102,91 @@ public class AdClickRealTimeStatSpark {
 
         // 通过对原始实时日志的处理
         // 将日志的格式处理成<yyyyMMdd_userid_adid, 1L>格式
-        JavaPairDStream<String, Integer> dailyUserAdClickDStream = adRealTimeLogDStream.mapToPair(
-                new PairFunction<Tuple2<String,String>, String, Integer>() {
+        JavaPairDStream<String, Long> dailyUserAdClickDStream = adRealTimeLogDStream.mapToPair(
 
-                @Override
-                public Tuple2<String, Integer> call(Tuple2<String, String> tuple) throws Exception {
-                    return null;
-                }
+                new PairFunction<Tuple2<String, String>, String, Long>() {
 
-            });
+                    @Override
+                    public Tuple2<String, Long> call(Tuple2<String, String> tuple) throws Exception {
+                        // 从tuple中获取到每一条原始的实时日志
+                        String log = tuple._2;
+                        String[] logSplited = log.split(" ");
 
+                        // 提取出日期（yyyyMMdd）、userid、adid
+                        String timestamp = logSplited[0];
+                        Date date = new Date(Long.valueOf(timestamp));
+                        String datakey = DateUtils.formatDateKey(date);
+
+                        long userid = Long.valueOf(logSplited[3]);
+                        long adid = Long.valueOf(logSplited[4]);
+
+                        // 拼接key
+                        String key = datakey + "_" + userid + "_" + adid;
+
+                        return new Tuple2<String, Long>(key, 1L);
+                    }
+
+                });
 
         // 针对处理后的日志格式，执行reduceByKey算子即可
         // （每个batch中）每天每个用户对每个广告的点击量
+        JavaPairDStream<String, Long> dailyUserAdClickCountDStream = dailyUserAdClickDStream.reduceByKey(
 
+                new Function2<Long, Long, Long>() {
+                    @Override
+                    public Long call(Long v1, Long v2) throws Exception {
+                        return v1 + v2;
+                    }
+                });
 
         // 到这里为止，获取到了什么数据呢？
         // dailyUserAdClickCountDStream DStream
         // 源源不断的，每个5s的batch中，当天每个用户对每支广告的点击次数
         // <yyyyMMdd_userid_adid, clickCount>
 
+        // 使用高性能方式将实时计算结果写到mysql中去
+        // 先针对MySQL表封装一个DAO   IAdUserClickCountDAO
+        // 用户广告点击量的一个domain  AdUserClickCount
 
+        dailyUserAdClickCountDStream.foreachRDD(new Function<JavaPairRDD<String, Long>, Void>() {
+            @Override
+            public Void call(JavaPairRDD<String, Long> rdd) throws Exception {
 
+                rdd.foreachPartition(new VoidFunction<Iterator<Tuple2<String, Long>>>() {
+                    @Override
+                    public void call(Iterator<Tuple2<String, Long>> iterator) throws Exception {
+                        // 对每个分区的数据就去获取一次连接对象
+                        // 每次都是从连接池中获取，而不是每次都创建
+                        // 写数据库操作，性能已经提到最高了
+                        List<AdUserClickCount> adUserClickCounts = new ArrayList<AdUserClickCount>();
 
+                        while (iterator.hasNext()) {
+                            Tuple2<String, Long> tuple = iterator.next();
+                            String[] keySplited = tuple._1.split("_");
+                            // yyyy-MM-dd
+                            String date = DateUtils.formatDate(DateUtils.parseDateKey(keySplited[0]));
+                            long userid = Long.valueOf(keySplited[1]);
+                            long adid = Long.valueOf(keySplited[2]);
+                            long clickCount = tuple._2;
 
+                            AdUserClickCount adUserClickCount = new AdUserClickCount();
+                            adUserClickCount.setDate(date);
+                            adUserClickCount.setUserid(userid);
+                            adUserClickCount.setAdid(adid);
+                            adUserClickCount.setClickCount(clickCount);
 
-//        JavaPairInputDStream<String, String> adRealTimeLogDStream = KafkaUtils.createDirectStream(
-//                jssc,
-//                String.class,
-//                String.class,
-//                StringDecoder.class,
-//                StringDecoder.class,
-//                kafkaParams,
-//                topics);
-//
-////		adRealTimeLogDStream.repartition(1000);
-//
-//        // 根据动态黑名单进行数据过滤
-//        JavaPairDStream<String, String> filteredAdRealTimeLogDStream =
-//                filterByBlacklist(adRealTimeLogDStream);
-//
+                            adUserClickCounts.add(adUserClickCount);
+                        }
+
+                        IAdUserClickCountDAO adUserClickCountDAO = DAOFactory.getAdUserClickCountDAO();
+                        adUserClickCountDAO.updateBatch(adUserClickCounts);
+                    }
+                });
+                return null;
+            }
+        });
+
+        
 
         // 构建完 spark streaming上下文之后，记得要进行上下文的启动、等待执行结束、关闭
         jssc.start();
