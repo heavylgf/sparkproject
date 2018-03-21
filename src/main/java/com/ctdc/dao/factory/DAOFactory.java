@@ -1,6 +1,8 @@
 package com.ctdc.dao.factory;
 
+import com.ctdc.dao.IAdBlacklistDAO;
 import com.ctdc.dao.IAdUserClickCountDAO;
+import com.ctdc.dao.impl.AdBlacklistDAOImpl;
 import com.ctdc.dao.impl.AdUserClickCountDAOImpl;
 
 /**
@@ -47,10 +49,10 @@ public class DAOFactory {
         return new AdUserClickCountDAOImpl();
     }
 
-//	public static IAdBlacklistDAO getAdBlacklistDAO() {
-//		return new AdBlacklistDAOImpl();
-//	}
-//
+	public static IAdBlacklistDAO getAdBlacklistDAO() {
+		return new AdBlacklistDAOImpl();
+	}
+
 //	public static IAdStatDAO getAdStatDAO() {
 //		return new AdStatDAOImpl();
 //	}

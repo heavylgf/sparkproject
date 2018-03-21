@@ -2,24 +2,30 @@ package com.ctdc.spark.ad;
 
 import com.ctdc.conf.ConfigurationManager;
 import com.ctdc.constant.Constants;
+import com.ctdc.dao.IAdBlacklistDAO;
 import com.ctdc.dao.IAdUserClickCountDAO;
 import com.ctdc.dao.factory.DAOFactory;
+import com.ctdc.domain.AdBlacklist;
 import com.ctdc.domain.AdUserClickCount;
 import com.ctdc.util.DateUtils;
 import kafka.serializer.StringDecoder;
 import org.apache.spark.SparkConf;
 import org.apache.spark.api.java.JavaPairRDD;
+import org.apache.spark.api.java.JavaRDD;
+import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.api.java.function.Function;
 import org.apache.spark.api.java.function.Function2;
 import org.apache.spark.api.java.function.PairFunction;
 import org.apache.spark.api.java.function.VoidFunction;
-import org.apache.spark.streaming.Duration;
 import org.apache.spark.streaming.Durations;
+import org.apache.spark.streaming.api.java.JavaDStream;
 import org.apache.spark.streaming.api.java.JavaPairDStream;
 import org.apache.spark.streaming.api.java.JavaPairInputDStream;
 import org.apache.spark.streaming.api.java.JavaStreamingContext;
 import org.apache.spark.streaming.kafka.KafkaUtils;
+
 import scala.Tuple2;
+import com.google.common.base.Optional;
 
 import java.util.*;
 
@@ -94,6 +100,140 @@ public class AdClickRealTimeStatSpark {
                 kafkaParams,
                 topics);
 
+        // 根据动态黑名单进行数据过滤
+        JavaPairDStream<String, String> filteredAdRealTimeLogDStream =
+                filterByBlacklist(adRealTimeLogDStream);
+
+        // 生成动态黑名单
+        generateDynamicBlacklist(filteredAdRealTimeLogDStream);
+
+
+        // 构建完 spark streaming上下文之后，记得要进行上下文的启动、等待执行结束、关闭
+        jssc.start();
+        jssc.awaitTermination();
+        jssc.close();
+
+    }
+
+    /**
+     * 根据黑名单进行过滤
+     *
+     * @param adRealTimeLogDStream
+     * @return
+     */
+    private static JavaPairDStream<String, String> filterByBlacklist(
+            JavaPairInputDStream<String, String> adRealTimeLogDStream) {
+        // 刚刚接受到原始的用户点击行为日志之后
+        // 根据mysql中的动态黑名单，进行实时的黑名单过滤（黑名单用户的点击行为，直接过滤掉，不要了）
+        // 使用transform算子（将dstream中的每个batch RDD进行处理，转换为任意的其他RDD，功能很强大）
+
+        JavaPairDStream<String, String> filteredAdRealTimeLogDStream = adRealTimeLogDStream.transformToPair(
+
+                new Function<JavaPairRDD<String, String>, JavaPairRDD<String, String>>() {
+
+                    private static final long serialVersionUID = 1L;
+
+                    @SuppressWarnings("resource")
+                    @Override
+                    public JavaPairRDD<String, String> call(
+                            JavaPairRDD<String, String> rdd) throws Exception {
+
+                        // 首先，从mysql中查询所有黑名单用户，将其转换为一个rdd
+                        IAdBlacklistDAO adBlacklistDAO = DAOFactory.getAdBlacklistDAO();
+                        List<AdBlacklist> adBlacklists = adBlacklistDAO.findAll();
+
+                        List<Tuple2<Long, Boolean>> tuples = new ArrayList<Tuple2<Long, Boolean>>();
+
+                        // 将查询出来的黑名单用户转换成一个 Tuple2
+                        for (AdBlacklist adBlacklist : adBlacklists) {
+                            tuples.add(new Tuple2<Long, Boolean>(adBlacklist.getUserid(), true));
+                        }
+
+                        JavaSparkContext sc = new JavaSparkContext(rdd.context());
+                        // 并行化成一个RDD
+                        JavaPairRDD<Long, Boolean> blacklistRDD = sc.parallelizePairs(tuples);
+
+                        // 将原始数据rdd映射成<userid, tuple2<string, string>>
+                        JavaPairRDD<Long, Tuple2<String, String>> mappedRDD = rdd.mapToPair(
+
+                                new PairFunction<Tuple2<String, String>, Long, Tuple2<String, String>>() {
+
+                                    private static final long serialVersionUID = 1L;
+
+                                    @Override
+                                    public Tuple2<Long, Tuple2<String, String>> call(
+                                            Tuple2<String, String> tuple)
+                                            throws Exception {
+                                        String log = tuple._2;
+                                        String[] logSplited = log.split(" ");
+                                        long userid = Long.valueOf(logSplited[3]);
+                                        return new Tuple2<Long, Tuple2<String, String>>(userid, tuple);
+                                    }
+
+                                });
+
+                        // 将原始日志数据rdd，与黑名单rdd，进行左外连接
+                        // 如果说原始日志的userid，没有在对应的黑名单中，join不到，左外连接
+                        // 用inner join，内连接，会导致数据丢失
+
+                        JavaPairRDD<Long, Tuple2<Tuple2<String, String>, Optional<Boolean>>> joinedRDD =
+                                mappedRDD.leftOuterJoin(blacklistRDD);
+
+                        // filter过滤
+                        JavaPairRDD<Long, Tuple2<Tuple2<String, String>, Optional<Boolean>>> filteredRDD = joinedRDD.filter(
+
+                                new Function<Tuple2<Long, Tuple2<Tuple2<String, String>, Optional<Boolean>>>, Boolean>() {
+
+                                    private static final long serialVersionUID = 1L;
+
+                                    @Override
+                                    public Boolean call(
+                                            Tuple2<Long, Tuple2<Tuple2<String, String>, Optional<Boolean>>> tuple)
+                                            throws Exception {
+                                        Optional<Boolean> optional = tuple._2._2;
+
+                                        // 如果这个值存在，那么说明原始日志中的userid，join到了某个黑名单用户
+                                        if (optional.isPresent() && optional.get()) {
+                                            return false;
+                                        }
+
+                                        return true;
+                                    }
+
+                                });
+
+                        // 映射成原始的数据类型
+                        JavaPairRDD<String, String> resultRDD = filteredRDD.mapToPair(
+
+                                new PairFunction<Tuple2<Long, Tuple2<Tuple2<String, String>, Optional<Boolean>>>, String, String>() {
+
+                                    private static final long serialVersionUID = 1L;
+
+                                    @Override
+                                    public Tuple2<String, String> call(
+                                            Tuple2<Long, Tuple2<Tuple2<String, String>, Optional<Boolean>>> tuple)
+                                            throws Exception {
+                                        return tuple._2._1;
+                                    }
+
+                                });
+
+                        return resultRDD;
+                    }
+
+                });
+
+        return filteredAdRealTimeLogDStream;
+    }
+
+    /**
+     * 生成动态黑名单
+     *
+     * @param filteredAdRealTimeLogDStream
+     */
+    private static void generateDynamicBlacklist(
+            JavaPairDStream<String, String> filteredAdRealTimeLogDStream) {
+
         // 一条一条的实时日志
         // timestamp province city userid adid
         // 某个时间点 某个省份 某个城市 某个用户 某个广告
@@ -102,7 +242,7 @@ public class AdClickRealTimeStatSpark {
 
         // 通过对原始实时日志的处理
         // 将日志的格式处理成<yyyyMMdd_userid_adid, 1L>格式
-        JavaPairDStream<String, Long> dailyUserAdClickDStream = adRealTimeLogDStream.mapToPair(
+        JavaPairDStream<String, Long> dailyUserAdClickDStream = filteredAdRealTimeLogDStream.mapToPair(
 
                 new PairFunction<Tuple2<String, String>, String, Long>() {
 
@@ -147,7 +287,6 @@ public class AdClickRealTimeStatSpark {
         // 使用高性能方式将实时计算结果写到mysql中去
         // 先针对MySQL表封装一个DAO   IAdUserClickCountDAO
         // 用户广告点击量的一个domain  AdUserClickCount
-
         dailyUserAdClickCountDStream.foreachRDD(new Function<JavaPairRDD<String, Long>, Void>() {
             @Override
             public Void call(JavaPairRDD<String, Long> rdd) throws Exception {
@@ -186,14 +325,149 @@ public class AdClickRealTimeStatSpark {
             }
         });
 
-        
+        // 现在我们在mysql里面，已经有了累计的每天各用户对各广告的点击量
+        // 遍历每个batch中的所有记录，对每条记录都要去查询一下，这一天这个用户对这个广告的累计点击量是多少
+        // 从mysql中查询
+        // 查询出来的结果，如果是100，如果你发现某个用户某天对某个广告的点击量已经大于等于100了
+        // 那么就判定这个用户就是黑名单用户，就写入mysql的表中，持久化
 
-        // 构建完 spark streaming上下文之后，记得要进行上下文的启动、等待执行结束、关闭
-        jssc.start();
-        jssc.awaitTermination();
-        jssc.close();
+        // 对batch中的数据，去查询mysql中的点击次数，使用哪个dstream呢？
+        // dailyUserAdClickCountDStream
+        // 为什么用这个batch？因为这个batch是聚合过的数据，已经按照yyyyMMdd_userid_adid进行过聚合了
+        // 比如原始数据可能是一个batch有一万条，聚合过后可能只有五千条
+        // 所以选用这个聚合后的dstream，既可以满足咱们的需求，而且呢，还可以尽量减少要处理的数据量
+        // 一石二鸟，一举两得
 
+        JavaPairDStream<String, Long> blacklistDStream = dailyUserAdClickCountDStream.filter(
+
+                new Function<Tuple2<String, Long>, Boolean>() {
+
+                    @Override
+                    public Boolean call(Tuple2<String, Long> tuple) throws Exception {
+                        String key = tuple._1;
+                        String[] keySplited = key.split("_");
+
+                        // yyyyMMdd -> yyyy-MM-dd
+                        String date = DateUtils.formatDate(DateUtils.parseDateKey(keySplited[0]));
+                        long userid = Long.valueOf(keySplited[1]);
+                        long adid = Long.valueOf(keySplited[2]);
+
+                        // 从mysql中查询指定日期指定用户对指定广告的点击量
+                        IAdUserClickCountDAO iAdUserClickCountDAO = DAOFactory.getAdUserClickCountDAO();
+                        int clickCount = iAdUserClickCountDAO.findClickCountByMultiKey(date, userid, adid);
+
+                        // 判断，如果点击量大于等于100，ok，那么不好意思，你就是黑名单用户
+                        // 那么就拉入黑名单，返回true
+                        if (clickCount >= 100) {
+                            return true;
+                        }
+                        // 反之，如果点击量小于100的，那么就暂时不要管它了
+                        return false;
+                    }
+                });
+
+        // blacklistDStream
+        // 里面的每个batch，其实就是都是过滤出来的已经在某天对某个广告点击量超过100的用户
+        // 遍历这个dstream中的每个rdd，然后将黑名单用户增加到mysql中
+        // 这里一旦增加以后，在整个这段程序的前面，会加上根据黑名单动态过滤用户的逻辑
+        // 我们可以认为，一旦用户被拉入黑名单之后，以后就不会再出现在这里了
+        // 所以直接插入mysql即可
+
+        // 我们有没有发现这里有一个小小的问题？
+        // blacklistDStream中，可能有userid是重复的，如果直接这样插入的话
+        // 那么是不是会发生，插入重复的黑明单用户
+        // 我们在插入前要进行去重
+        // yyyyMMdd_userid_adid
+        // 20151220_10001_10002 100
+        // 20151220_10001_10003 100
+        // 10001这个userid就重复了
+
+        // 实际上，是要通过对dstream执行操作，对其中的rdd中的userid进行全局的去重
+        JavaDStream<Long> blacklistUseridDStream = blacklistDStream.map(
+
+                new Function<Tuple2<String, Long>, Long>() {
+                    @Override
+                    public Long call(Tuple2<String, Long> tuple) throws Exception {
+                        String key = tuple._1;
+                        String[] keySplited = key.split("_");
+                        Long userid = Long.valueOf(keySplited[1]);
+                        return userid;
+                    }
+
+                });
+
+        JavaDStream<Long> distinctBlacklistUseridDStream = blacklistUseridDStream.transform(
+
+                new Function<JavaRDD<Long>, JavaRDD<Long>>() {
+                    @Override
+                    public JavaRDD<Long> call(JavaRDD<Long> rdd) throws Exception {
+                        return rdd.distinct();
+                    }
+
+                });
+
+        // 到这一步为止，distinctBlacklistUseridDStream
+        // 每一个rdd，只包含了userid，而且还进行了全局的去重，保证每一次过滤出来的黑名单用户都没有重复的
+        distinctBlacklistUseridDStream.foreachRDD(new Function<JavaRDD<Long>, Void>() {
+
+            @Override
+            public Void call(JavaRDD<Long> rdd) throws Exception {
+
+                rdd.foreachPartition(new VoidFunction<Iterator<Long>>() {
+
+                    @Override
+                    public void call(Iterator<Long> iterator) throws Exception {
+                        List<AdBlacklist> adBlacklists = new ArrayList<AdBlacklist>();
+
+                        while (iterator.hasNext()) {
+                            long userid = iterator.next();
+
+                            AdBlacklist adBlacklist = new AdBlacklist();
+                            adBlacklist.setUserid(userid);
+
+                            adBlacklists.add(adBlacklist);
+                        }
+
+                        IAdBlacklistDAO adBlacklistDAO = DAOFactory.getAdBlacklistDAO();
+                        adBlacklistDAO.insertBatch(adBlacklists);
+
+                        // 到此为止，我们其实已经实现了动态黑名单了
+                        // 1、计算出每个batch中的每天每个用户对每个广告的点击量，并持久化到mysql中
+
+                        // 2、依据上述计算出来的数据，对每个batch中的按date、userid、adid聚合的数据
+                        // 都要遍历一遍，查询一下，对应的累计的点击次数，如果超过了100，那么就认定为黑名单
+                        // 然后对黑名单用户进行去重，去重后，将黑名单用户，持久化插入到mysql中
+                        // 所以说mysql中的ad_blacklist表中的黑名单用户，就是动态地实时地增长的
+                        // 所以说，mysql中的ad_blacklist表，就可以认为是一张动态黑名单
+
+                        // 3、基于上述计算出来的动态黑名单，在最一开始，就对每个batch中的点击行为
+                        // 根据动态黑名单进行过滤
+                        // 把黑名单中的用户的点击行为，直接过滤掉
+
+                        // 动态黑名单机制，就完成了
+
+                        // 第一套spark课程，spark streaming阶段，有个小案例，也是黑名单
+                        // 但是那只是从实际项目中抽取出来的案例而已
+                        // 作为技术的学习，（案例），包装（基于你公司的一些业务），项目，找工作
+                        // 锻炼和实战自己spark技术，没问题的
+                        // 但是，那还不是真真正正的项目
+
+                        // 第一个spark课程：scala、spark core、源码、调优、spark sql、spark streaming
+                        // 总共加起来（scala+spark）的案例，将近上百个
+                        // 搞通透，精通以后，1~2年spark相关经验，没问题
+
+                        // 第二个spark课程（项目）：4个模块，涵盖spark core、spark sql、spark streaming
+                        // 企业级性能调优、troubleshooting、数据倾斜解决方案、实际的数据项目开发流程
+                        // 大数据项目架构
+                        // 加上第一套课程，2~3年的spark相关经验，没问题
+
+                    }
+                });
+                return null;
+            }
+        });
 
     }
+
 
 }
